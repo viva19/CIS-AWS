@@ -1,0 +1,1166 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: SecureAWS
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Password Policy Parameters
+        Parameters:
+          - AllowUsersToChangePassword
+          - HardExpiry
+          - MaxPasswordAge
+          - MinimumPasswordLength
+          - PasswordReusePrevention
+          - RequireLowercaseCharacters
+          - RequireNumbers
+          - RequireSymbols
+          - RequireUppercaseCharacters
+Parameters:
+  Email:
+    Description: 'Email used for notifications '
+    Type: String
+    Default: '-'
+  LogGroupCIS:
+    Description: Log Group used for metric filters
+    Type: String
+    Default: CFlogGroup
+  AlarmThreshold:
+    Type: String
+    Description: Spending Threshold
+  AllowUsersToChangePassword:
+    Description: >-
+      You can permit all IAM users in your account to use the IAM console to
+      change their own passwords.
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+  HardExpiry:
+    Description: >-
+      You can prevent IAM users from choosing a new password after their current
+      password has expired.
+    Type: String
+    Default: false
+    AllowedValues:
+      - true
+      - false
+  MaxPasswordAge:
+    Description: >-
+      You can set IAM user passwords to be valid for only the specified number
+      of days.
+    Type: Number
+    Default: 90
+    ConstraintDescription: 'Must be in the range [0-1095]'
+    MinValue: 0
+    MaxValue: 1095
+  MinimumPasswordLength:
+    Description: >-
+      You can specify the minimum number of characters allowed in an IAM user
+      password.
+    Type: Number
+    Default: 12
+    ConstraintDescription: 'Must be in the range [6-128]'
+    MinValue: 6
+    MaxValue: 128
+  PasswordReusePrevention:
+    Description: >-
+      You can prevent IAM users from reusing a specified number of previous
+      passwords.
+    Type: Number
+    Default: 6
+    ConstraintDescription: 'Must be in the range [1-24]'
+    MinValue: 1
+    MaxValue: 24
+  RequireLowercaseCharacters:
+    Description: >-
+      You can require that IAM user passwords contain at least one lowercase
+      character from the ISO basic Latin alphabet (a to z).
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+  RequireNumbers:
+    Description: >-
+      You can require that IAM user passwords contain at least one numeric
+      character (0 to 9).
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+  RequireSymbols:
+    Description: >-
+      You can require that IAM user passwords contain at least one of the
+      following nonalphanumeric characters: ! @ # $ % ^ & * ( ) _ + - = [ ] {} |
+      '
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+  RequireUppercaseCharacters:
+    Description: >-
+      You can require that IAM user passwords contain at least one uppercase
+      character from the ISO basic Latin alphabet (A to Z).
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+Resources:
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+        - PolicyName: iam
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:UpdateAccountPasswordPolicy'
+                  - 'iam:DeleteAccountPasswordPolicy'
+                Resource: '*'
+  LambdaFunction: # needs no monitoring because it is used as a custom resource
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile:
+          !Sub |
+            'use strict';
+            const AWS = require('aws-sdk');
+            const response = require('cfn-response');
+            const iam = new AWS.IAM({apiVersion: '2010-05-08'});
+            exports.handler = (event, context, cb) => {
+              console.log(`Invoke: ${!JSON.stringify(event)}`);
+              const done = (err) => {
+                if (err) {
+                  console.log(`Error: ${!JSON.stringify(err)}`);
+                  response.send(event, context, response.FAILED, {});
+                } else {
+                  response.send(event, context, response.SUCCESS, {});
+                }
+              };
+              if (event.RequestType === 'Delete') {
+                iam.deleteAccountPasswordPolicy({}, done);
+              } else if (event.RequestType === 'Create' || event.RequestType === 'Update') {
+                iam.updateAccountPasswordPolicy({
+                  AllowUsersToChangePassword: ${AllowUsersToChangePassword},
+                  HardExpiry: ${HardExpiry},
+                  MaxPasswordAge: ${MaxPasswordAge},
+                  MinimumPasswordLength: ${MinimumPasswordLength},
+                  PasswordReusePrevention: ${PasswordReusePrevention},
+                  RequireLowercaseCharacters: ${RequireLowercaseCharacters},
+                  RequireNumbers: ${RequireNumbers},
+                  RequireSymbols: ${RequireSymbols},
+                  RequireUppercaseCharacters: ${RequireUppercaseCharacters},
+                }, done);
+              } else {
+                cb(new Error(`unsupported RequestType: ${!event.RequestType}`));
+              }
+            };
+      Handler: 'index.handler'
+      MemorySize: 128
+      Role: !GetAtt 'LambdaRole.Arn'
+      Runtime: 'nodejs6.10'
+      Timeout: 60
+
+  PasswordPolicy:
+    DependsOn: LambdaFunction
+    Type: 'Custom::PasswordPolicy'
+    Version: '1.0'
+    Properties:
+      ServiceToken: !GetAtt 'LambdaFunction.Arn'
+  CFLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      RetentionInDays: '60'
+  TrailLogGroupRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudtrail.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: cloudtrail-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 'logs:CreateLogStream'
+                Resource: !GetAtt
+                  - CFLogGroup
+                  - Arn
+              - Effect: Allow
+                Action: 'logs:PutLogEvents'
+                Resource: !GetAtt
+                  - CFLogGroup
+                  - Arn
+  myKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: A sample key
+      Enabled: 'True'
+      EnableKeyRotation: 'True'
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default-1
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS: !Join
+                - ''
+                - - 'arn:aws:iam::'
+                  - !Ref 'AWS::AccountId'
+                  - ':root'
+            Action:
+              - 'kms:Create*'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Revoke*'
+              - 'kms:Disable*'
+              - 'kms:Get*'
+              - 'kms:Delete*'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+          - Sid: Allow local use of the key
+            Effect: Allow
+            Principal:
+              AWS: !Join
+                - ''
+                - - 'arn:aws:iam::'
+                  - !Ref 'AWS::AccountId'
+                  - ':root'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+  myKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: alias/myKeyAlias
+      TargetKeyId: !Ref myKey
+  Bucket:
+    DeletionPolicy: Retain
+    Type: 'AWS::S3::Bucket'
+    Properties: {}
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:GetBucketAcl'
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref Bucket
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref Bucket
+                - /AWSLogs/
+                - !Ref 'AWS::AccountId'
+                - /*
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+  snsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: ''
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
+  TopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      Topics:
+        - !Ref snsTopic
+      PolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Sid: AWSCloudTrailSNSPolicy
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Resource: '*'
+            Action: 'SNS:Publish'
+  cloudTrail:
+    DependsOn:
+      - BucketPolicy
+      - TopicPolicy
+    Type: 'AWS::CloudTrail::Trail'
+    Properties:
+      S3BucketName: !Ref Bucket
+      IncludeGlobalServiceEvents: 'true'
+      CloudWatchLogsLogGroupArn: !GetAtt
+        - CFLogGroup
+        - Arn
+      CloudWatchLogsRoleArn: !GetAtt
+        - TrailLogGroupRole
+        - Arn
+      SnsTopicName: !GetAtt
+        - snsTopic
+        - TopicName
+      IsLogging: 'true'
+      IsMultiRegionTrail: 'true'
+      EnableLogFileValidation: 'true'
+      KMSKeyId: !Ref myKey
+  configBucket:
+    DeletionPolicy: Retain
+    Type: 'AWS::S3::Bucket'
+    Properties: {}
+  ConfigRole:
+    Type: 'AWS::IAM::Role'
+    DependsOn: configBucket
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSConfigRole'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AssumeRole1
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: s3-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 's3:PutObject'
+                Resource: !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref configBucket
+                    - /*
+                Condition:
+                  StringLike:
+                    's3:x-amz-acl': bucket-owner-full-control
+              - Effect: Allow
+                Action: 's3:GetBucketAcl'
+                Resource: !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref configBucket
+                    - /*
+  AlarmNotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
+  31logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.errorCode = "*UnauthorizedOperation") && ($.errorCode =
+        "AccessDenied*" ) }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS31
+          MetricName: unauthorized Operations notifications
+  31logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 31logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: unauthorized Operations notifications
+      Namespace: AWSCIS31
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  32logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.additionalEventData.MFAUsed = "No") && ($.eventName =
+        "ConsoleLogin") }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS32
+          MetricName: >-
+            Ensure a log metric filter and alarm exist for Management Console
+            sign-in without MFA
+  32logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 32logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: >-
+        Ensure a log metric filter and alarm exist for Management Console
+        sign-in without MFA
+      Namespace: AWSCIS32
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  33logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS &&
+        $.eventType != "AwsServiceEvent" }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS33
+          MetricName: Ensure a log metric filter and alarm exist for usage of root account
+  33logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 33logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: Ensure a log metric filter and alarm exist for usage of root account
+      Namespace: AWSCIS33
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  34logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventName=DeleteGroupPolicy) || ($.eventName=DeleteUserPolicy) ||
+        ($.eventName=PutGroupPolicy) || ($.eventName=PutRolePolicy) ||
+        ($.eventName=PutUserPolicy) || ($.eventName=CreatePolicy) ||
+        ($.eventName=DeletePolicy) || ($.eventName=CreatePolicyVersion) ||
+        ($.eventName=DeletePolicyVersion)  || ($.eventName=AttachRolePolicy) }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS34
+          MetricName: Ensure a log metric filter and alarm exist for IAM policy changes
+  34logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 34logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: Ensure a log metric filter and alarm exist for IAM policy changes
+      Namespace: AWSCIS34
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  35logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventName = CreateTrail) || ($.eventName = UpdateTrail) ||
+        ($.eventName = DeleteTrail) || ($.eventName = StartLogging) ||
+        ($.eventName = StopLogging) }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS35
+          MetricName: Ensure a log metric filter and alarm exist for CloudTrail
+            configuration changes
+  35logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 35logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: >-
+        Ensure a log metric filter and alarm exist for CloudTrail configuration
+        changes
+      Namespace: AWSCIS35
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  36logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventName = ConsoleLogin) && ($.errorMessage =
+        "Failedauthentication")}
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS36
+          MetricName: >-
+            Ensure a log metric filter and alarm exist for AWS Management
+            Console authentication failures
+  36logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 36logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: >-
+        Ensure a log metric filter and alarm exist for AWS Management Console
+        authentication failures
+      Namespace: AWSCIS36
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  37logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventSource=kms.amazonaws.com) && (($.eventName=DisableKey) ||
+        ($.eventName=ScheduleKeyDeletion)) }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS37
+          MetricName: >-
+            Ensure a log metric filter and alarm exist for disabling or
+            scheduled deletion of customer created CMKs
+  37logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 37logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: >-
+        Ensure a log metric filter and alarm exist for disabling or scheduled
+        deletion of customer created CMKs
+      Namespace: AWSCIS37
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  38logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventSource=s3.amazonaws.com) && (($.eventName=PutBucketAcl) ||
+        ($.eventName = PutBucketPolicy) || ($.eventName = PutBucketCors) ||
+        ($.eventName = PutBucketLifecycle) || ($.eventName =
+        PutBucketReplication) || ($.eventName = DeleteBucketPolicy) ||
+        ($.eventName = DeleteBucketCors) || ($.eventName=DeleteBucketLifecycle)
+        || ($.eventName = DeleteBucketReplication)) }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS38
+          MetricName: >-
+            Ensure a log metric filter and alarm exist for S3 bucket policy
+            changes
+  38logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 38logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: Ensure a log metric filter and alarm exist for S3 bucket policy changes
+      Namespace: AWSCIS38
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  39logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        {($.eventSource = config.amazonaws.com) &&
+        (($.eventName=StopConfigurationRecorder)||($.eventName=DeleteDeliveryChannel)||($.eventName=PutDeliveryChannel)||($.eventName=PutConfigurationRecorder))}
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS39
+          MetricName: >-
+            Ensure a log metric filter and alarm exist for AWS Config
+            configuration changes
+  39logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 39logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: >-
+        Ensure a log metric filter and alarm exist for AWS Config configuration
+        changes
+      Namespace: AWSCIS39
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  310logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventName = AuthorizeSecurityGroupIngress) || ($.eventName =
+        AuthorizeSecurityGroupEgress) || ($.eventName =
+        RevokeSecurityGroupIngress) || ($.eventName = RevokeSecurityGroupEgress)
+        || ($.eventName = CreateSecurityGroup) || ($.eventName =
+        DeleteSecurityGroup)}
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS310
+          MetricName: >-
+            Ensure a log metric filter and alarm exist for security group
+            changes
+  310logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 310logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: Ensure a log metric filter and alarm exist for security group changes
+      Namespace: AWSCIS310
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  311logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventName = CreateNetworkAcl) || ($.eventName =
+        CreateNetworkAclEntry) || ($.eventName = DeleteNetworkAcl) ||
+        ($.eventName = DeleteNetworkAclEntry) || ($.eventName =
+        ReplaceNetworkAclEntry) || ($.eventName = ReplaceNetworkAclAssociation)}
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS311
+          MetricName: >-
+            Ensure a log metric filter and alarm exist for changes to Network
+            Access Control Lists
+  311logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 311logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: >-
+        Ensure a log metric filter and alarm exist for changes to Network Access
+        Control Lists
+      Namespace: AWSCIS311
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  312logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventName = CreateCustomerGateway) || ($.eventName =
+        DeleteCustomerGateway) || ($.eventName = AttachInternetGateway) ||
+        ($.eventName = CreateInternetGateway) || ($.eventName =
+        DeleteInternetGateway) || ($.eventName = DetachInternetGateway) }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS312
+          MetricName: >-
+            Ensure a log metric filter and alarm exist for changes to network
+            gateways
+  312logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 312logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: >-
+        Ensure a log metric filter and alarm exist for changes to network
+        gateways
+      Namespace: AWSCIS312
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  313logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventName = CreateRoute) || ($.eventName = CreateRouteTable) ||
+        ($.eventName = ReplaceRoute) || ($.eventName =
+        ReplaceRouteTableAssociation) || ($.eventName = DeleteRouteTable) ||
+        ($.eventName = DeleteRoute) || ($.eventName = DisassociateRouteTable) }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS313
+          MetricName: Ensure a log metric filter and alarm exist for route table changes
+  313logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 313logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: Ensure a log metric filter and alarm exist for route table changes
+      Namespace: AWSCIS313
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  314logsMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventName = CreateVpc) || ($.eventName = DeleteVpc) || ($.eventName
+        = ModifyVpcAttribute) || ($.eventName = AcceptVpcPeeringConnection) ||
+        ($.eventName = CreateVpcPeeringConnection) || ($.eventName =
+        DeleteVpcPeeringConnection) || ($.eventName =
+        RejectVpcPeeringConnection) || ($.eventName = AttachClassicLinkVpc) ||
+        ($.eventName = DetachClassicLinkVpc) || ($.eventName =
+        DisableVpcClassicLink) || ($.eventName = EnableVpcClassicLink) }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: AWSCIS314
+          MetricName: Ensure a log metric filter and alarm exist for VPC changes
+  314logsMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 314logsMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: Ensure a log metric filter and alarm exist for VPC changes
+      Namespace: AWSCIS314
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+
+  SpendingAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: !Join
+        - ''
+        - - Alarm if AWS spending is over $
+          - !Ref AlarmThreshold
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      Statistic: Maximum
+      Period: '21600'
+      EvaluationPeriods: '1'
+      Threshold: !Ref AlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      InsufficientDataActions:
+        - !Ref AlarmNotificationTopic
+
+  s3BucketMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      FilterPattern: >-
+        { ($.eventSource = s3.amazonaws.com) && (($.eventName = PutBucketAcl) ||
+        ($.eventName = PutBucketPolicy) || ($.eventName = PutBucketCors) ||
+        ($.eventName = PutBucketLifecycle) || ($.eventName =
+        PutBucketReplication) || ($.eventName = DeleteBucketPolicy) ||
+        ($.eventName = DeleteBucketCors) || ($.eventName =
+        DeleteBucketLifecycle) || ($.eventName = DeleteBucketReplication)) }
+      LogGroupName: !Ref LogGroupCIS
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: s3BucketChanges
+          MetricName: CloudWatch Alarm for AWS S3 Bucket Changes
+  s3BucketMetricFilterAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: s3BucketMetricFilterAlarm
+      AlarmDescription: Alarmsunauthorized Operations notifications
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      MetricName: CloudWatch Alarm for AWS S3 Bucket Changes
+      Namespace: s3BucketChanges
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+  FlowLogRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Join
+        - '-'
+        - - FlowLogRole
+          - !Ref 'AWS::Region'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+  RolePolicies:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: FlowLogRolePolicies
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+              - 'logs:DescribeLogGroups'
+              - 'logs:DescribeLogStreams'
+            Effect: Allow
+            Resource: '*'
+      Roles:
+        - !Ref FlowLogRole
+  CISVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: 'false'
+      EnableDnsHostnames: 'false'
+      InstanceTenancy: dedicated
+      Tags:
+        - Key: foo
+          Value: bar
+  secGroupName:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: '-'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: '0'
+          ToPort: '22'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '0'
+          ToPort: '3389'
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref CISVPC
+  MyFlowLog:
+    Type: 'AWS::EC2::FlowLog'
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt
+        - FlowLogRole
+        - Arn
+      LogGroupName: FlowLogsGroup
+      ResourceId: !Ref CISVPC
+      ResourceType: VPC
+      TrafficType: ALL
+
+  CaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+  ResponderPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: "All Permissions incident response needs to interact with ec2 and IAM roles."
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - "s3:*"
+            Resource:
+              Fn::Join: ['', ['arn:aws:s3:::', {Ref: CaseBucket}, '/*' ]]
+          -
+            Effect: "Allow"
+            Action:
+              - "cloudtrail:DescribeTrails"
+              - "cloudtrail:GetTrailStatus"
+              - "cloudtrail:ListTags"
+              - "cloudtrail:LookupEvents"
+              - "cloudtrail:StartLogging"
+              - "cloudtrail:UpdateTrail"
+              - "ec2:DescribeRegions"
+              - "ec2:DescribeAvailabilityZones"
+              - "ec2:DescribeInstances"
+              - "ec2:AttachVolume"
+              - "ec2:AuthorizeSecurityGroupEgress"
+              - "ec2:AuthorizeSecurityGroupIngress"
+              - "ec2:CopyImage"
+              - "ec2:CopySnapshot"
+              - "ec2:CreateFlowLogs"
+              - "ec2:CreateImage"
+              - "ec2:CreateKeyPair"
+              - "ec2:CreateNetworkAcl"
+              - "ec2:CreateNetworkAclEntry"
+              - "ec2:CreateSecurityGroup"
+              - "ec2:CreateSnapshot"
+              - "ec2:CreateSubnet"
+              - "ec2:CreateTags"
+              - "ec2:DetachNetworkInterface"
+              - "ec2:DetachVolume"
+              - "ec2:GetConsoleOutput"
+              - "ec2:GetConsoleScreenshot"
+              - "ec2:ImportImage"
+              - "ec2:ImportInstance"
+              - "ec2:ImportKeyPair"
+              - "ec2:ImportSnapshot"
+              - "ec2:ImportVolume"
+              - "ec2:ModifyInstanceAttribute"
+              - "ec2:ModifySnapshotAttribute"
+              - "ec2:ModifySubnetAttribute"
+              - "ec2:ModifyVolumeAttribute"
+              - "ec2:RebootInstances"
+              - "ec2:ReportInstanceStatus"
+              - "ec2:ResetSnapshotAttribute"
+              - "ec2:RestoreAddressToClassic"
+              - "ec2:RevokeSecurityGroupEgress"
+              - "ec2:RevokeSecurityGroupIngress"
+              - "ec2:StopInstances"
+              - "iam:AddRoleToInstanceProfile"
+              - "iam:AttachRolePolicy"
+              - "iam:AttachUserPolicy"
+              - "iam:DetachRolePolicy"
+              - "iam:DetachUserPolicy"
+              - "iam:CreatePolicy"
+              - "iam:GetAccessKeyLastUsed"
+              - "iam:PutRolePolicy"
+              - "iam:PutUserPolicy"
+              - "iam:UpdateAccessKey"
+              - "iam:UpdateUser"
+            Resource: "*"
+      ManagedPolicyName: "ResponderPermissions"
+
+
+Outputs:
+  LambdaRoleOutput:
+    Description: Lambda role created for Custom password policy
+    Value: !Ref LambdaRole
+  LambdaFunctionOutput:
+    Description: LambdaFunction created for password Policy
+    Value: !Ref LambdaFunction
+  PasswordPolicyOutput:
+    Description: Password policy
+    Value: !Ref PasswordPolicy
+  CFLogGroupOutPut:
+    Description: CFLogGroup
+    Value: !Ref CFLogGroup
+  TrailLogGroupRoleOutput:
+    Description: TrailLogGroupRole
+    Value: !Ref TrailLogGroupRole
+  KMSkeyOutput:
+    Description: KMSKeyId
+    Value: !Ref myKey
+  KeyAliasOutput:
+    Description: KMS key Alias
+    Value: !Ref myKeyAlias
+  s3BucketOutput:
+    Description: S3 Bucket
+    Value: !Ref Bucket
+  BucketPolicyOutput:
+    Description: S3 Bucket Policy
+    Value: !Ref BucketPolicy
+  SnsOutput:
+    Description: SNS output
+    Value: !Ref snsTopic
+  SnsPolicyOutput:
+    Description: SNS Policy output
+    Value: !Ref TopicPolicy
+  CloudTrailOutput:
+    Description: Cloudtrail
+    Value: !Ref cloudTrail
+  configBucketOutput:
+    Description: Config Bucket
+    Value: !Ref configBucket
+  configRoleOutput:
+    Description: Config Role
+    Value: !Ref ConfigRole
+
+  AlarmNotificationTopicOutput:
+    Description: Notification Topic
+    Value: !Ref AlarmNotificationTopic
+  31logsMetricFilterOutput:
+    Description: Metric Filter unauthorized Operations notifications
+    Value: !Ref 31logsMetricFilter
+  31logsMetricFilterAlarmOutput:
+    Description: Metric Filter Alarm unauthorized Operations notifications
+    Value: !Ref 31logsMetricFilterAlarm
+  32logsMetricFilterOutput:
+    Description: Metric Filter Ensure a log metric filter and alarm exist for Management Console sign-in without MFA
+    Value: !Ref 32logsMetricFilter
+  32logsMetricFilterAlarmOutput:
+    Description: Metric Filter Alarm Ensure a log metric filter and alarm exist for Management Console sign-in without MFA
+    Value: !Ref 32logsMetricFilterAlarm
+  33logsMetricFilterOutput:
+    Description: Metric Filter Ensure a log metric filter and alarm exist for usage of root account
+    Value: !Ref 33logsMetricFilter
+  33logsMetricFilterAlarmOutput:
+    Description: Metric Filter Alarm Ensure a log metric filter and alarm exist for usage of root account
+    Value: !Ref 33logsMetricFilterAlarm
+  34logsMetricFilterOutput:
+    Description: Metric Filter Ensure a log metric filter and alarm exist for IAM policy changes
+    Value: !Ref 34logsMetricFilter
+  34logsMetricFilterAlarmOutput:
+    Description: Metric Filter Alarm Ensure a log metric filter and alarm exist for IAM policy changes
+    Value: !Ref 34logsMetricFilterAlarm
+  35logsMetricFilterOutput:
+    Description: Metric Filter Ensure a log metric filter and alarm exist for CloudTrail configuration changes
+    Value: !Ref 35logsMetricFilter
+  35logsMetricFilterAlarmOutput:
+    Description: Metric Filter Alarm Ensure a log metric filter and alarm exist for CloudTrail configuration changes
+    Value: !Ref 35logsMetricFilterAlarm
+  36logsMetricFilterOutput:
+    Description: Ensure a log metric filter and alarm exist for AWS Management Console authentication failures
+    Value: !Ref 36logsMetricFilter
+  36logsMetricFilterAlarmOutput:
+    Description: Ensure a log metric filter and alarm exist for AWS Management Console authentication failures
+    Value: !Ref 36logsMetricFilterAlarm
+  37logsMetricFilterOutput:
+    Description: Ensure a log metric filter and alarm exist for disabling or scheduled deletion of customer created CMKs
+    Value: !Ref 37logsMetricFilter
+  37logsMetricFilterAlarmOutput:
+    Description: Ensure a log metric filter and alarm exist for disabling or scheduled deletion of customer created CMKs
+    Value: !Ref 37logsMetricFilterAlarm
+  38logsMetricFilterOutput:
+    Description: Ensure a log metric filter and alarm exist for S3 bucket policy changes
+    Value: !Ref 38logsMetricFilter
+  38logsMetricFilterAlarmOutput:
+    Description: Ensure a log metric filter and alarm exist for S3 bucket policy changes
+    Value: !Ref 38logsMetricFilterAlarm
+  39logsMetricFilterOutput:
+    Description: Ensure a log metric filter and alarm exist for AWS Config configuration changes
+    Value: !Ref 39logsMetricFilter
+  39logsMetricFilterAlarmOutput:
+    Description: Ensure a log metric filter and alarm exist for AWS Config configuration changes
+    Value: !Ref 39logsMetricFilterAlarm
+  310logsMetricFilterOutput:
+    Description: Ensure a log metric filter and alarm exist for security group changes
+    Value: !Ref 310logsMetricFilter
+  310logsMetricFilterAlarmOutput:
+    Description: Ensure a log metric filter and alarm exist for security group changes
+    Value: !Ref 310logsMetricFilterAlarm
+  311logsMetricFilterOutput:
+    Description: Ensure a log metric filter and alarm exist for changes to Network ACL
+    Value: !Ref 311logsMetricFilter
+  311logsMetricFilterAlarmOutput:
+    Description: Ensure a log metric filter and alarm exist for changes to Network ACL
+    Value: !Ref 311logsMetricFilterAlarm
+  312logsMetricFilterOutput:
+    Description: Ensure a log metric filter and alarm exist for changes to network gateway
+    Value: !Ref 312logsMetricFilter
+  312logsMetricFilterAlarmOutput:
+    Description: Ensure a log metric filter and alarm exist for changes to network gateways
+    Value: !Ref 312logsMetricFilterAlarm
+  313logsMetricFilterOutput:
+    Description: Ensure a log metric filter and alarm exist for route table changes
+    Value: !Ref 313logsMetricFilter
+  313logsMetricFilterAlarmOutput:
+    Description: Ensure a log metric filter and alarm exist for route table changes
+    Value: !Ref 313logsMetricFilterAlarm
+  314logsMetricFilterOutput:
+    Description: Ensure a log metric filter and alarm exist for VPC changes
+    Value: !Ref 314logsMetricFilter
+  314logsMetricFilterAlarmOutput:
+    Description: Ensure a log metric filter and alarm exist for VPC changes
+    Value: !Ref 314logsMetricFilterAlarm
+  SpendingAlarmOutput:
+    Description: Spending Alarm if charges are above Threshold
+    Value: !Ref SpendingAlarm
+  s3MetricFilterOutput:
+    Description: Monitor s3
+    Value: !Ref s3BucketMetricFilter
+  s3MetricFilterAlarmOutput:
+    Description: Monitoring s3 alarm
+    Value: !Ref s3BucketMetricFilterAlarm
+  flowlogOutput:
+    Description : FlowLogRole Output
+    Value : !Ref FlowLogRole
+  flowlogRoleOutput:
+    Description : FlowLogRole Policies
+    Value : !Ref RolePolicies
+  customVPCOutput:
+    Description : Custom VPC
+    Value : !Ref CISVPC
+  customSGOutput:
+    Description : Custom SG
+    Value : !Ref secGroupName
+  MyFlowLogOutput:
+    Description : Custom flowlog
+    Value : !Ref MyFlowLog
